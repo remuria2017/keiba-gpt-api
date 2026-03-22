@@ -1,8 +1,9 @@
 import os
+import shutil
 from typing import List, Optional, Any
 
 import duckdb
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -103,3 +104,15 @@ def run_backtest(req: BacktestRequest, x_api_key: str | None = Header(default=No
             "tan_return": float(row[3] or 0),
         }
     }
+
+@app.post("/upload-db")
+async def upload_db(file: UploadFile = File(...), x_api_key: str | None = Header(default=None)):
+    check_api_key(x_api_key)
+
+    os.makedirs("/app/data", exist_ok=True)
+    path = "/app/data/keiba.duckdb"
+
+    with open(path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    return {"ok": True, "path": path, "size": os.path.getsize(path)}
