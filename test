@@ -1,0 +1,26 @@
+import duckdb
+
+con = duckdb.connect(r"C:\keiba\keiba.duckdb")
+
+rows = con.execute("""
+WITH x AS (
+  SELECT
+    クラスコード,
+    貼りつき名,
+    COUNT(*) AS n,
+    ROW_NUMBER() OVER (
+      PARTITION BY クラスコード
+      ORDER BY COUNT(*) DESC
+    ) AS rn
+  FROM backtest_with_training_clean
+  WHERE クラスコード >= 115
+  GROUP BY 1,2
+)
+SELECT クラスコード, 貼りつき名, n
+FROM x
+WHERE rn <= 10
+ORDER BY クラスコード, n DESC
+""").fetchall()
+
+for r in rows:
+    print(r)
