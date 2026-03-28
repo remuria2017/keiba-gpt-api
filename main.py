@@ -1,15 +1,23 @@
-
 import os
 import shutil
 import traceback
+import re
 from typing import Any, Dict, List, Optional, Literal, Tuple, Union
 
 import duckdb
 from fastapi import FastAPI, Header, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # =========================
 # 設定
@@ -20,7 +28,7 @@ API_KEY = os.getenv("BACKTEST_API_KEY", "").strip()
 
 def resolve_db_path() -> str:
     env_path = os.getenv("DB_PATH", "").strip()
-    candidates = []
+    candidates: List[str] = []
 
     if env_path:
         candidates.append(env_path)
@@ -69,27 +77,28 @@ class ColumnFilterItem(BaseModel):
     right: str
 
 
-class ConditionNode(BaseModel):
-    and_: Optional[List["Condition"]] = Field(default=None, alias="and")
-    or_: Optional[List["Condition"]] = Field(default=None, alias="or")
-    not_: Optional["Condition"] = Field(default=None, alias="not")
-    field: Optional[str] = None
-    op: Optional[Literal["=", "!=", ">", ">=", "<", "<=", "in", "like", "between", "is_null", "is_not_null"]] = None
-    value: Any = None
-    left: Optional[str] = None
-    right: Optional[str] = None
-    type: Optional[Literal["filter", "column"]] = None
-
-
-Condition = Union[ConditionNode, FilterItem, ColumnFilterItem]
+class ExprFilterItem(BaseModel):
+    expr: str
+    op: Literal["=", "!=", ">", ">=", "<", "<="]
+    value: Any
 
 
 class MetricItem(BaseModel):
     name: str
     agg: Literal[
-        "count", "sum", "avg", "min", "max", "median", "stddev",
-        "win_rate", "place_rate", "tan_return", "fuku_return",
-        "hit_count", "place_hit_count"
+        "count",
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "median",
+        "stddev",
+        "win_rate",
+        "place_rate",
+        "tan_return",
+        "fuku_return",
+        "hit_count",
+        "place_hit_count",
     ]
     field: Optional[str] = None
 
@@ -105,24 +114,58 @@ class OrderByItem(BaseModel):
     direction: Literal["asc", "desc"] = "asc"
 
 
+class WhereCondition(BaseModel):
+    field: str
+    op: Literal["=", "!=", ">", ">=", "<", "<=", "in", "like", "between", "is_null", "is_not_null"]
+    value: Any = None
+
+
+class WhereColumnCondition(BaseModel):
+    type: Literal["column"]
+    left: str
+    op: Literal["=", "!=", ">", ">=", "<", "<="]
+    right: str
+
+
+WhereLeaf = Union[WhereCondition, WhereColumnCondition]
+
+
+class WhereAnd(BaseModel):
+    and_: List["WhereNode"] = Field(alias="and")
+
+
+class WhereOr(BaseModel):
+    or_: List["WhereNode"] = Field(alias="or")
+
+
+class WhereNot(BaseModel):
+    not_: "WhereNode" = Field(alias="not")
+
+
+WhereNode = Union[WhereCondition, WhereColumnCondition, WhereAnd, WhereOr, WhereNot]
+WhereAnd.model_rebuild()
+WhereOr.model_rebuild()
+WhereNot.model_rebuild()
+
+
 class QueryRequest(BaseModel):
-    # 旧仕様
     mode: Literal["summary", "rows", "breakdown", "aggregate"] = "summary"
+
+    # 旧互換
     filters: List[FilterItem] = Field(default_factory=list)
     column_filters: List[ColumnFilterItem] = Field(default_factory=list)
-    group_by: Optional[Union[str, List[str]]] = None
-    limit: int = 100
 
     # 新仕様
-    where: Optional[ConditionNode] = None
+    where: Optional[WhereNode] = None
+    expr_filters: List[ExprFilterItem] = Field(default_factory=list)
+
+    group_by: Optional[Union[str, List[str]]] = None
+    select: Optional[List[str]] = None
     metrics: List[MetricItem] = Field(default_factory=list)
     having: List[HavingItem] = Field(default_factory=list)
     order_by: List[OrderByItem] = Field(default_factory=list)
-    select: Optional[List[str]] = None
+    limit: int = 100
     offset: int = 0
-
-
-ConditionNode.model_rebuild()
 
 
 # =========================
@@ -249,13 +292,32 @@ FIELD_CANDIDATES: Dict[str, List[str]] = {
     "lap_last": ["lap_last"],
 }
 
-
 NUMERIC_FIELD_NAMES = {
     "horse_no", "人気", "確定着順", "単勝オッズ", "クラスコード", "距離",
     "年齢", "頭数", "馬番", "年", "月", "日", "斤量", "上がり3Fタイム", "PCI",
     "class_code", "distance", "age", "field_size", "odds", "finish", "agari3f", "weight",
     "rank", "lap_1", "lap_2", "lap_3", "lap_4", "lap_last",
 }
+
+ALLOWED_OPS = {"=", "!=", ">", ">=", "<", "<=", "in", "like", "between", "is_null", "is_not_null"}
+ALLOWED_COLUMN_OPS = {"=", "!=", ">", ">=", "<", "<="}
+ALLOWED_EXPR_FILTER_OPS = {"=", "!=", ">", ">=", "<", "<="}
+ALLOWED_METRIC_AGGS = {
+    "count", "sum", "avg", "min", "max", "median", "stddev",
+    "win_rate", "place_rate", "tan_return", "fuku_return",
+    "hit_count", "place_hit_count",
+}
+ALLOWED_HAVING_OPS = {"=", "!=", ">", ">=", "<", "<="}
+
+DERIVED_EXPR_MAP = {
+    "4F合計": "lap_4 + lap_3 + lap_2 + lap_last",
+    "加速ラップ": "lap_last < lap_2",
+    "減速ラップ": "lap_last > lap_2",
+    "同ラップ": "lap_last = lap_2",
+}
+
+_ALLOWED_EXPR_TOKENS = re.compile(r'[A-Za-z0-9_\u4e00-\u9fff\u3040-\u30ff・() +\-*/.<>=!]+$')
+_EXPR_FIELD_TOKEN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*|[\u4e00-\u9fff\u3040-\u30ff・]+')
 
 
 def resolve_actual_column(field: str, schema_map: Dict[str, str]) -> str:
@@ -284,14 +346,8 @@ def field_expr(field: str, schema_map: Dict[str, str]) -> str:
     return q
 
 
-ALLOWED_OPS = {"=", "!=", ">", ">=", "<", "<=", "in", "like", "between", "is_null", "is_not_null"}
-ALLOWED_COLUMN_OPS = {"=", "!=", ">", ">=", "<", "<="}
-ALLOWED_HAVING_OPS = {"=", "!=", ">", ">=", "<", "<="}
-ALLOWED_METRICS = {
-    "count", "sum", "avg", "min", "max", "median", "stddev",
-    "win_rate", "place_rate", "tan_return", "fuku_return",
-    "hit_count", "place_hit_count"
-}
+def field_label(field: str, schema_map: Dict[str, str]) -> str:
+    return resolve_actual_column(field, schema_map)
 
 
 def normalize_group_by(group_by: Optional[Union[str, List[str]]]) -> List[str]:
@@ -306,23 +362,49 @@ def normalize_group_by(group_by: Optional[Union[str, List[str]]]) -> List[str]:
     raise HTTPException(status_code=400, detail="group_by must be string or string[]")
 
 
-def normalize_select(select_cols: Optional[List[str]]) -> List[str]:
-    if not select_cols:
+def normalize_select(select: Optional[List[str]]) -> List[str]:
+    if select is None:
         return []
-    uniq: List[str] = []
-    seen = set()
-    for c in select_cols:
-        if c not in seen:
-            uniq.append(c)
-            seen.add(c)
-    return uniq
+    if not isinstance(select, list):
+        raise HTTPException(status_code=400, detail="select must be string[]")
+    return select
+
+
+def build_safe_expr(expr: str, schema_map: Dict[str, str]) -> str:
+    expr = (expr or "").strip()
+    if not expr:
+        raise HTTPException(status_code=400, detail="expr must not be empty")
+
+    expr = DERIVED_EXPR_MAP.get(expr, expr)
+
+    if not _ALLOWED_EXPR_TOKENS.fullmatch(expr):
+        raise HTTPException(status_code=400, detail=f"Unsafe expr: {expr}")
+
+    def repl(m: re.Match) -> str:
+        token = m.group(0)
+
+        # 論理語や関数名風トークンはそのまま通さない
+        lowered = token.lower()
+        if lowered in {"and", "or", "not", "null", "true", "false"}:
+            return token
+
+        if token in FIELD_CANDIDATES or token in schema_map:
+            return field_expr(token, schema_map)
+
+        # 数字だけのようなものはここには来ないはずだが念のため
+        if re.fullmatch(r"\d+", token):
+            return token
+
+        raise HTTPException(status_code=400, detail=f"Unknown token in expr: {token}")
+
+    return _EXPR_FIELD_TOKEN.sub(repl, expr)
 
 
 # =========================
-# WHERE 構築
+# where / filters
 # =========================
 
-def build_simple_filter_clause(f: FilterItem, schema_map: Dict[str, str]) -> Tuple[str, List[Any]]:
+def build_filter_clause(f: FilterItem, schema_map: Dict[str, str]) -> Tuple[str, List[Any]]:
     if f.op not in ALLOWED_OPS:
         raise HTTPException(status_code=400, detail=f"Operator not allowed: {f.op}")
 
@@ -342,7 +424,7 @@ def build_simple_filter_clause(f: FilterItem, schema_map: Dict[str, str]) -> Tup
 
     if f.op == "between":
         if not isinstance(f.value, list) or len(f.value) != 2:
-            raise HTTPException(status_code=400, detail=f"BETWEEN value must be [low, high]: {f.field}")
+            raise HTTPException(status_code=400, detail=f"BETWEEN value must be a list of length 2: {f.field}")
         return f"{expr} BETWEEN ? AND ?", [f.value[0], f.value[1]]
 
     if f.op == "is_null":
@@ -354,85 +436,81 @@ def build_simple_filter_clause(f: FilterItem, schema_map: Dict[str, str]) -> Tup
     raise HTTPException(status_code=400, detail=f"Unsupported operator: {f.op}")
 
 
-def build_simple_column_clause(cf: ColumnFilterItem, schema_map: Dict[str, str]) -> Tuple[str, List[Any]]:
+def build_column_filter_clause(cf: ColumnFilterItem, schema_map: Dict[str, str]) -> Tuple[str, List[Any]]:
     if cf.op not in ALLOWED_COLUMN_OPS:
         raise HTTPException(status_code=400, detail=f"Column operator not allowed: {cf.op}")
-
     left_expr = field_expr(cf.left, schema_map)
     right_expr = field_expr(cf.right, schema_map)
     return f"{left_expr} {cf.op} {right_expr}", []
 
 
-def build_condition_node(node: ConditionNode, schema_map: Dict[str, str]) -> Tuple[str, List[Any]]:
-    parts: List[str] = []
-    params: List[Any] = []
+def build_expr_filter_clause(ef: ExprFilterItem, schema_map: Dict[str, str]) -> Tuple[str, List[Any]]:
+    if ef.op not in ALLOWED_EXPR_FILTER_OPS:
+        raise HTTPException(status_code=400, detail=f"Expr operator not allowed: {ef.op}")
+    expr_sql = build_safe_expr(ef.expr, schema_map)
+    return f"({expr_sql}) {ef.op} ?", [ef.value]
 
-    if node.and_ is not None:
+
+def build_where_node(node: WhereNode, schema_map: Dict[str, str]) -> Tuple[str, List[Any]]:
+    if isinstance(node, WhereCondition):
+        return build_filter_clause(FilterItem(field=node.field, op=node.op, value=node.value), schema_map)
+
+    if isinstance(node, WhereColumnCondition):
+        return build_column_filter_clause(
+            ColumnFilterItem(left=node.left, op=node.op, right=node.right),
+            schema_map,
+        )
+
+    if isinstance(node, WhereAnd):
         if not node.and_:
-            raise HTTPException(status_code=400, detail="and must be non-empty")
-        child_sqls = []
+            return "1=1", []
+        clauses: List[str] = []
+        params: List[Any] = []
         for child in node.and_:
-            child_sql, child_params = build_condition(child, schema_map)
-            child_sqls.append(f"({child_sql})")
+            child_sql, child_params = build_where_node(child, schema_map)
+            clauses.append(f"({child_sql})")
             params.extend(child_params)
-        return " AND ".join(child_sqls), params
+        return " AND ".join(clauses), params
 
-    if node.or_ is not None:
+    if isinstance(node, WhereOr):
         if not node.or_:
-            raise HTTPException(status_code=400, detail="or must be non-empty")
-        child_sqls = []
+            return "1=0", []
+        clauses = []
+        params: List[Any] = []
         for child in node.or_:
-            child_sql, child_params = build_condition(child, schema_map)
-            child_sqls.append(f"({child_sql})")
+            child_sql, child_params = build_where_node(child, schema_map)
+            clauses.append(f"({child_sql})")
             params.extend(child_params)
-        return " OR ".join(child_sqls), params
+        return " OR ".join(clauses), params
 
-    if node.not_ is not None:
-        child_sql, child_params = build_condition(node.not_, schema_map)
+    if isinstance(node, WhereNot):
+        child_sql, child_params = build_where_node(node.not_, schema_map)
         return f"NOT ({child_sql})", child_params
 
-    if node.type == "column" or (node.left and node.right):
-        if not node.left or not node.right or not node.op:
-            raise HTTPException(status_code=400, detail="column condition requires left, op, right")
-        return build_simple_column_clause(
-            ColumnFilterItem(left=node.left, op=node.op, right=node.right),
-            schema_map
-        )
-
-    if node.field and node.op:
-        return build_simple_filter_clause(
-            FilterItem(field=node.field, op=node.op, value=node.value),
-            schema_map
-        )
-
-    raise HTTPException(status_code=400, detail="Invalid where condition node")
+    raise HTTPException(status_code=400, detail="Invalid where node")
 
 
-def build_condition(cond: Condition, schema_map: Dict[str, str]) -> Tuple[str, List[Any]]:
-    if isinstance(cond, FilterItem):
-        return build_simple_filter_clause(cond, schema_map)
-    if isinstance(cond, ColumnFilterItem):
-        return build_simple_column_clause(cond, schema_map)
-    if isinstance(cond, ConditionNode):
-        return build_condition_node(cond, schema_map)
-    raise HTTPException(status_code=400, detail="Invalid condition type")
-
-
-def build_where_from_legacy(
+def build_where_legacy(
     filters: List[FilterItem],
     column_filters: List[ColumnFilterItem],
+    expr_filters: List[ExprFilterItem],
     schema_map: Dict[str, str]
 ) -> Tuple[str, List[Any]]:
     clauses = ["1=1"]
     params: List[Any] = []
 
     for f in filters:
-        sql, p = build_simple_filter_clause(f, schema_map)
+        sql, p = build_filter_clause(f, schema_map)
         clauses.append(sql)
         params.extend(p)
 
     for cf in column_filters:
-        sql, p = build_simple_column_clause(cf, schema_map)
+        sql, p = build_column_filter_clause(cf, schema_map)
+        clauses.append(sql)
+        params.extend(p)
+
+    for ef in expr_filters:
+        sql, p = build_expr_filter_clause(ef, schema_map)
         clauses.append(sql)
         params.extend(p)
 
@@ -443,16 +521,28 @@ def build_where(
     req: QueryRequest,
     schema_map: Dict[str, str]
 ) -> Tuple[str, List[Any], str]:
+    """
+    戻り値:
+      where_sql, params, where_mode
+    """
     if req.where is not None:
-        sql, params = build_condition(req.where, schema_map)
-        return sql, params, "where"
+        base_sql, base_params = build_where_node(req.where, schema_map)
+        clauses = [f"({base_sql})"]
+        params = list(base_params)
 
-    sql, params = build_where_from_legacy(req.filters, req.column_filters, schema_map)
-    return sql, params, "legacy"
+        for ef in req.expr_filters:
+            sql, p = build_expr_filter_clause(ef, schema_map)
+            clauses.append(sql)
+            params.extend(p)
+
+        return " AND ".join(clauses), params, "where"
+
+    where_sql, params = build_where_legacy(req.filters, req.column_filters, req.expr_filters, schema_map)
+    return where_sql, params, "legacy"
 
 
 # =========================
-# 集計用
+# サマリー / 指標
 # =========================
 
 def resolve_summary_columns(schema_map: Dict[str, str]) -> Tuple[str, str]:
@@ -461,253 +551,232 @@ def resolve_summary_columns(schema_map: Dict[str, str]) -> Tuple[str, str]:
     return finish_expr, odds_expr
 
 
-def build_metric_sql(metric: MetricItem, schema_map: Dict[str, str]) -> str:
-    if metric.agg not in ALLOWED_METRICS:
-        raise HTTPException(status_code=400, detail=f"Metric agg not allowed: {metric.agg}")
+def metric_sql(item: MetricItem, schema_map: Dict[str, str]) -> str:
+    if item.agg not in ALLOWED_METRIC_AGGS:
+        raise HTTPException(status_code=400, detail=f"Metric agg not allowed: {item.agg}")
 
+    alias = quote_ident(item.name)
     finish_expr, odds_expr = resolve_summary_columns(schema_map)
 
-    if metric.agg == "count":
-        return "COUNT(*)"
+    if item.agg == "count":
+        return f"COUNT(*) AS {alias}"
 
-    if metric.agg in {"sum", "avg", "min", "max", "median", "stddev"}:
-        if not metric.field:
-            raise HTTPException(status_code=400, detail=f"field is required for metric agg={metric.agg}")
-        expr = field_expr(metric.field, schema_map)
-        if metric.agg == "sum":
-            return f"SUM({expr})"
-        if metric.agg == "avg":
-            return f"ROUND(AVG({expr}), 4)"
-        if metric.agg == "min":
-            return f"MIN({expr})"
-        if metric.agg == "max":
-            return f"MAX({expr})"
-        if metric.agg == "median":
-            return f"MEDIAN({expr})"
-        if metric.agg == "stddev":
-            return f"ROUND(STDDEV_SAMP({expr}), 4)"
+    if item.agg == "win_rate":
+        return f"ROUND(AVG(CASE WHEN {finish_expr} = 1 THEN 1.0 ELSE 0.0 END) * 100, 2) AS {alias}"
 
-    if metric.agg == "hit_count":
-        return f"SUM(CASE WHEN {finish_expr} = 1 THEN 1 ELSE 0 END)"
+    if item.agg == "place_rate":
+        return f"ROUND(AVG(CASE WHEN {finish_expr} <= 3 THEN 1.0 ELSE 0.0 END) * 100, 2) AS {alias}"
 
-    if metric.agg == "place_hit_count":
-        return f"SUM(CASE WHEN {finish_expr} <= 3 THEN 1 ELSE 0 END)"
+    if item.agg == "tan_return":
+        return f"ROUND(AVG(CASE WHEN {finish_expr} = 1 THEN {odds_expr} ELSE 0 END) * 100, 2) AS {alias}"
 
-    if metric.agg == "win_rate":
-        return f"ROUND(AVG(CASE WHEN {finish_expr} = 1 THEN 1.0 ELSE 0.0 END) * 100, 2)"
+    if item.agg == "hit_count":
+        return f"SUM(CASE WHEN {finish_expr} = 1 THEN 1 ELSE 0 END) AS {alias}"
 
-    if metric.agg == "place_rate":
-        return f"ROUND(AVG(CASE WHEN {finish_expr} <= 3 THEN 1.0 ELSE 0.0 END) * 100, 2)"
+    if item.agg == "place_hit_count":
+        return f"SUM(CASE WHEN {finish_expr} <= 3 THEN 1 ELSE 0 END) AS {alias}"
 
-    if metric.agg == "tan_return":
-        return f"ROUND(AVG(CASE WHEN {finish_expr} = 1 THEN {odds_expr} ELSE 0 END) * 100, 2)"
+    if item.agg == "fuku_return":
+        raise HTTPException(status_code=400, detail="fuku_return is not supported because payout column is not available in current source table")
 
-    if metric.agg == "fuku_return":
-        raise HTTPException(status_code=400, detail="fuku_return is not available yet because payout column does not exist")
+    if not item.field:
+        raise HTTPException(status_code=400, detail=f"field is required for metric agg: {item.agg}")
 
-    raise HTTPException(status_code=400, detail=f"Unsupported metric agg: {metric.agg}")
+    expr = field_expr(item.field, schema_map)
 
+    if item.agg == "sum":
+        return f"ROUND(SUM({expr}), 6) AS {alias}"
+    if item.agg == "avg":
+        return f"ROUND(AVG({expr}), 6) AS {alias}"
+    if item.agg == "min":
+        return f"MIN({expr}) AS {alias}"
+    if item.agg == "max":
+        return f"MAX({expr}) AS {alias}"
+    if item.agg == "median":
+        return f"ROUND(MEDIAN({expr}), 6) AS {alias}"
+    if item.agg == "stddev":
+        return f"ROUND(STDDEV_SAMP({expr}), 6) AS {alias}"
 
-def default_summary_metrics() -> List[MetricItem]:
-    return [
-        MetricItem(name="n", agg="count"),
-        MetricItem(name="win_rate", agg="win_rate"),
-        MetricItem(name="place_rate", agg="place_rate"),
-        MetricItem(name="tan_return", agg="tan_return"),
-    ]
+    raise HTTPException(status_code=400, detail=f"Unsupported metric agg: {item.agg}")
 
 
-def normalize_metrics(req: QueryRequest) -> List[MetricItem]:
-    if req.metrics:
-        return req.metrics
+# =========================
+# SQLビルダー
+# =========================
 
-    if req.mode in {"summary", "breakdown"}:
-        return default_summary_metrics()
-
-    return []
-
-
-def build_having_sql(having: List[HavingItem], metric_alias_map: Dict[str, str]) -> str:
-    if not having:
-        return ""
-
-    clauses = []
-    for h in having:
-        if h.op not in ALLOWED_HAVING_OPS:
-            raise HTTPException(status_code=400, detail=f"Having operator not allowed: {h.op}")
-        alias = metric_alias_map.get(h.metric)
-        if not alias:
-            raise HTTPException(status_code=400, detail=f"Unknown having metric: {h.metric}")
-        clauses.append(f'{quote_ident(alias)} {h.op} ?')
-    return " HAVING " + " AND ".join(clauses)
-
-
-def build_having_params(having: List[HavingItem]) -> List[Any]:
-    return [h.value for h in having]
-
-
-def build_order_by_sql(
-    order_by: List[OrderByItem],
-    allowed_targets: Dict[str, str],
-    default_order: Optional[str] = None
-) -> str:
-    if not order_by:
-        return f" ORDER BY {default_order}" if default_order else ""
-
-    parts = []
-    for item in order_by:
-        target = allowed_targets.get(item.target)
-        if not target:
-            raise HTTPException(status_code=400, detail=f"Unknown order_by target: {item.target}")
-        direction = item.direction.upper()
-        parts.append(f"{target} {direction}")
-    return " ORDER BY " + ", ".join(parts)
-
-
-def build_aggregate_sql(
-    source_table: str,
-    schema_map: Dict[str, str],
-    where_sql: str,
-    req: QueryRequest
-) -> Tuple[str, List[Any], List[str], List[MetricItem]]:
-    group_fields = normalize_group_by(req.group_by)
-    metrics = normalize_metrics(req)
-
-    if not metrics:
-        raise HTTPException(status_code=400, detail="metrics is required for aggregate mode")
-
-    group_select_parts: List[str] = []
-    group_alias_map: Dict[str, str] = {}
-    for i, g in enumerate(group_fields, start=1):
-        expr = field_expr(g, schema_map)
-        alias = f"group_{i}"
-        group_select_parts.append(f"{expr} AS {quote_ident(alias)}")
-        group_alias_map[g] = quote_ident(alias)
-
-    metric_select_parts: List[str] = []
-    metric_alias_map: Dict[str, str] = {}
-    for m in metrics:
-        alias = m.name
-        if alias in metric_alias_map:
-            raise HTTPException(status_code=400, detail=f"Duplicate metric name: {alias}")
-        metric_sql = build_metric_sql(m, schema_map)
-        metric_select_parts.append(f"{metric_sql} AS {quote_ident(alias)}")
-        metric_alias_map[alias] = alias
-
-    select_parts = group_select_parts + metric_select_parts
-    if not select_parts:
-        raise HTTPException(status_code=400, detail="Nothing to select")
-
-    select_sql = ",\n        ".join(select_parts)
+def build_summary_sql(source_table: str, schema_map: Dict[str, str], where_sql: str) -> str:
+    finish_expr, odds_expr = resolve_summary_columns(schema_map)
     src = quote_ident(source_table)
 
-    sql = f"""
+    return f"""
     SELECT
-        {select_sql}
+        COUNT(*) AS n,
+        ROUND(AVG(CASE WHEN {finish_expr} = 1 THEN 1.0 ELSE 0.0 END) * 100, 2) AS win_rate,
+        ROUND(AVG(CASE WHEN {finish_expr} <= 3 THEN 1.0 ELSE 0.0 END) * 100, 2) AS place_rate,
+        ROUND(AVG(CASE WHEN {finish_expr} = 1 THEN {odds_expr} ELSE 0 END) * 100, 2) AS tan_return
     FROM {src}
     WHERE {where_sql}
     """
 
-    if group_fields:
-        group_by_sql = ", ".join([field_expr(g, schema_map) for g in group_fields])
-        sql += f"\nGROUP BY {group_by_sql}"
 
-    having_sql = build_having_sql(req.having, metric_alias_map)
-    sql += having_sql
+def build_breakdown_sql(
+    source_table: str,
+    schema_map: Dict[str, str],
+    where_sql: str,
+    group_by: Union[str, List[str]],
+    limit: int,
+    offset: int,
+) -> str:
+    finish_expr, odds_expr = resolve_summary_columns(schema_map)
+    group_fields = normalize_group_by(group_by)
+    if not group_fields:
+        raise HTTPException(status_code=400, detail="group_by is required for breakdown mode")
 
-    allowed_order_targets: Dict[str, str] = {}
-    for g, alias in group_alias_map.items():
-        allowed_order_targets[g] = alias
-    for metric_alias in metric_alias_map.keys():
-        allowed_order_targets[metric_alias] = quote_ident(metric_alias)
+    group_exprs = [field_expr(g, schema_map) for g in group_fields]
+    select_parts = [f"{expr} AS {quote_ident(g)}" for expr, g in zip(group_exprs, group_fields)]
+    group_select_sql = ",\n        ".join(select_parts)
+    group_by_sql = ", ".join(group_exprs)
+    order_cols = ", ".join([quote_ident(g) for g in group_fields])
+    src = quote_ident(source_table)
 
-    default_order = None
-    if "n" in metric_alias_map:
-        default_order = f'{quote_ident("n")} DESC'
-        if group_fields:
-            default_order += ", " + ", ".join(group_alias_map[g] for g in group_fields)
-
-    sql += build_order_by_sql(req.order_by, allowed_order_targets, default_order=default_order)
-
-    safe_limit = max(1, min(req.limit, 10000))
-    safe_offset = max(0, req.offset)
-    sql += f"\nLIMIT {safe_limit}\nOFFSET {safe_offset}"
-
-    params = build_having_params(req.having)
-    result_columns = [m.name for m in metrics]
-    return sql, params, group_fields + result_columns, metrics
+    return f"""
+    SELECT
+        {group_select_sql},
+        COUNT(*) AS n,
+        ROUND(AVG(CASE WHEN {finish_expr} = 1 THEN 1.0 ELSE 0.0 END) * 100, 2) AS win_rate,
+        ROUND(AVG(CASE WHEN {finish_expr} <= 3 THEN 1.0 ELSE 0.0 END) * 100, 2) AS place_rate,
+        ROUND(AVG(CASE WHEN {finish_expr} = 1 THEN {odds_expr} ELSE 0 END) * 100, 2) AS tan_return
+    FROM {src}
+    WHERE {where_sql}
+    GROUP BY {group_by_sql}
+    ORDER BY n DESC, {order_cols}
+    LIMIT {limit}
+    OFFSET {offset}
+    """
 
 
 def build_rows_sql(
     source_table: str,
     schema_map: Dict[str, str],
     where_sql: str,
-    req: QueryRequest
+    select: Optional[List[str]],
+    order_by: List[OrderByItem],
+    limit: int,
+    offset: int,
 ) -> str:
     src = quote_ident(source_table)
-    select_cols = normalize_select(req.select)
+    select_fields = normalize_select(select)
 
-    if select_cols:
-        select_sql = ", ".join([
-            f"{field_expr(c, schema_map)} AS {quote_ident(resolve_actual_column(c, schema_map))}"
-            for c in select_cols
-        ])
-        allowed_order_targets = {
-            c: quote_ident(resolve_actual_column(c, schema_map))
-            for c in select_cols
-        }
+    if select_fields:
+        select_exprs = [f"{field_expr(f, schema_map)} AS {quote_ident(field_label(f, schema_map))}" for f in select_fields]
+        select_sql = ", ".join(select_exprs)
+        allowed_order_targets = set(select_fields) | set(field_label(f, schema_map) for f in select_fields)
     else:
         select_sql = "*"
-        allowed_order_targets = {
-            c: field_expr(c, schema_map)
-            for c in FIELD_CANDIDATES.keys()
-            if c in FIELD_CANDIDATES
-        }
-        for c in schema_map.keys():
-            allowed_order_targets[c] = quote_ident(c)
+        allowed_order_targets = set(FIELD_CANDIDATES.keys()) | set(schema_map.keys())
 
-    sql = f"""
+    order_parts: List[str] = []
+    for item in order_by:
+        if item.target not in allowed_order_targets:
+            raise HTTPException(status_code=400, detail=f"order_by target not allowed in rows mode: {item.target}")
+        order_parts.append(f"{field_expr(item.target, schema_map)} {item.direction.upper()}")
+
+    order_sql = f" ORDER BY {', '.join(order_parts)}" if order_parts else ""
+
+    return f"""
     SELECT {select_sql}
     FROM {src}
     WHERE {where_sql}
+    {order_sql}
+    LIMIT {limit}
+    OFFSET {offset}
     """
 
-    default_order = None
-    if "race_date" in schema_map:
-        default_order = f'{quote_ident("race_date")} DESC'
-    elif "年" in schema_map and "月" in schema_map and "日" in schema_map:
-        default_order = f'{quote_ident("年")} DESC, {quote_ident("月")} DESC, {quote_ident("日")} DESC'
 
-    sql += build_order_by_sql(req.order_by, allowed_order_targets, default_order=default_order)
+def build_aggregate_sql(
+    source_table: str,
+    schema_map: Dict[str, str],
+    where_sql: str,
+    group_by: Optional[Union[str, List[str]]],
+    metrics: List[MetricItem],
+    having: List[HavingItem],
+    order_by: List[OrderByItem],
+    limit: int,
+    offset: int,
+) -> str:
+    if not metrics:
+        raise HTTPException(status_code=400, detail="metrics is required for aggregate mode")
 
-    safe_limit = max(1, min(req.limit, 10000))
-    safe_offset = max(0, req.offset)
-    sql += f"\nLIMIT {safe_limit}\nOFFSET {safe_offset}"
-    return sql
+    src = quote_ident(source_table)
+    group_fields = normalize_group_by(group_by)
+
+    select_parts: List[str] = []
+    group_sql_parts: List[str] = []
+
+    for g in group_fields:
+        expr = field_expr(g, schema_map)
+        alias = quote_ident(field_label(g, schema_map))
+        select_parts.append(f"{expr} AS {alias}")
+        group_sql_parts.append(expr)
+
+    metric_names = set()
+    for m in metrics:
+        if m.name in metric_names:
+            raise HTTPException(status_code=400, detail=f"Duplicate metric name: {m.name}")
+        metric_names.add(m.name)
+        select_parts.append(metric_sql(m, schema_map))
+
+    select_sql = ",\n        ".join(select_parts)
+
+    group_by_sql = ""
+    if group_sql_parts:
+        group_by_sql = f"\n    GROUP BY {', '.join(group_sql_parts)}"
+
+    having_sql = ""
+    if having:
+        clauses: List[str] = []
+        for h in having:
+            if h.op not in ALLOWED_HAVING_OPS:
+                raise HTTPException(status_code=400, detail=f"Having operator not allowed: {h.op}")
+            if h.metric not in metric_names:
+                raise HTTPException(status_code=400, detail=f"Unknown having metric: {h.metric}")
+            clauses.append(f"{quote_ident(h.metric)} {h.op} {sql_literal(h.value)}")
+        having_sql = f"\n    HAVING {' AND '.join(clauses)}"
+
+    allowed_order_targets = set(metric_names) | set(field_label(g, schema_map) for g in group_fields)
+    order_parts: List[str] = []
+    for o in order_by:
+        if o.target not in allowed_order_targets:
+            raise HTTPException(status_code=400, detail=f"Unknown order_by target: {o.target}")
+        order_parts.append(f"{quote_ident(o.target)} {o.direction.upper()}")
+
+    if not order_parts:
+        if "n" in metric_names:
+            order_parts.append('"n" DESC')
+        elif metrics:
+            order_parts.append(f'{quote_ident(metrics[0].name)} DESC')
+
+    order_sql = f"\n    ORDER BY {', '.join(order_parts)}"
+
+    return f"""
+    SELECT
+        {select_sql}
+    FROM {src}
+    WHERE {where_sql}{group_by_sql}{having_sql}{order_sql}
+    LIMIT {limit}
+    OFFSET {offset}
+    """
 
 
-def build_summary_sql(source_table: str, schema_map: Dict[str, str], where_sql: str, req: QueryRequest):
-    cloned = req.model_copy(deep=True)
-    cloned.mode = "aggregate"
-    cloned.metrics = default_summary_metrics()
-    cloned.group_by = None
-    cloned.having = []
-    if not cloned.order_by:
-        cloned.order_by = []
-    return build_aggregate_sql(source_table, schema_map, where_sql, cloned)
-
-
-def build_breakdown_sql(source_table: str, schema_map: Dict[str, str], where_sql: str, req: QueryRequest):
-    group_fields = normalize_group_by(req.group_by)
-    if not group_fields:
-        raise HTTPException(status_code=400, detail="group_by is required for breakdown mode")
-
-    cloned = req.model_copy(deep=True)
-    cloned.mode = "aggregate"
-    cloned.metrics = default_summary_metrics()
-    cloned.group_by = group_fields
-    cloned.having = []
-    return build_aggregate_sql(source_table, schema_map, where_sql, cloned)
+def sql_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
+    s = str(value).replace("'", "''")
+    return f"'{s}'"
 
 
 # =========================
@@ -719,8 +788,8 @@ def health():
     db_exists = os.path.exists(DB_PATH)
 
     source_table = None
-    schema_map = {}
-    tables = []
+    schema_map: Dict[str, str] = {}
+    tables: List[str] = []
 
     if db_exists:
         con = get_connection(read_only=True)
@@ -742,13 +811,16 @@ def health():
         "allowed_filter_names": sorted(list(FIELD_CANDIDATES.keys()) + list(schema_map.keys())),
         "allowed_ops": sorted(list(ALLOWED_OPS)),
         "allowed_column_filter_ops": sorted(list(ALLOWED_COLUMN_OPS)),
-        "allowed_metric_aggs": sorted(list(ALLOWED_METRICS)),
+        "allowed_expr_filter_ops": sorted(list(ALLOWED_EXPR_FILTER_OPS)),
+        "allowed_metric_aggs": sorted(list(ALLOWED_METRIC_AGGS)),
         "supported_modes": ["summary", "rows", "breakdown", "aggregate"],
         "supports_where_tree": True,
         "supports_select": True,
         "supports_order_by": True,
         "supports_having": True,
         "supports_offset": True,
+        "supports_expr_filters": True,
+        "derived_expr_names": sorted(list(DERIVED_EXPR_MAP.keys())),
     }
 
 
@@ -775,32 +847,60 @@ def query_backtest(req: QueryRequest, x_api_key: Optional[str] = Header(default=
         source_table = resolve_source_table(con)
         schema_map = get_schema_map(con, source_table)
 
-        where_sql, where_params, where_mode = build_where(req, schema_map)
+        where_sql, params, where_mode = build_where(req, schema_map)
 
         if req.mode == "summary":
-            sql, extra_params, _, _ = build_summary_sql(source_table, schema_map, where_sql, req)
+            sql = build_summary_sql(source_table, schema_map, where_sql)
 
         elif req.mode == "rows":
-            sql = build_rows_sql(source_table, schema_map, where_sql, req)
-            extra_params = []
+            safe_limit = max(1, min(req.limit, 1000))
+            safe_offset = max(0, req.offset)
+            sql = build_rows_sql(
+                source_table=source_table,
+                schema_map=schema_map,
+                where_sql=where_sql,
+                select=req.select,
+                order_by=req.order_by,
+                limit=safe_limit,
+                offset=safe_offset,
+            )
 
         elif req.mode == "breakdown":
-            sql, extra_params, _, _ = build_breakdown_sql(source_table, schema_map, where_sql, req)
+            if not req.group_by:
+                raise HTTPException(status_code=400, detail="group_by is required for breakdown mode")
+            safe_limit = max(1, min(req.limit, 1000))
+            safe_offset = max(0, req.offset)
+            sql = build_breakdown_sql(
+                source_table=source_table,
+                schema_map=schema_map,
+                where_sql=where_sql,
+                group_by=req.group_by,
+                limit=safe_limit,
+                offset=safe_offset,
+            )
 
         elif req.mode == "aggregate":
-            sql, extra_params, _, _ = build_aggregate_sql(source_table, schema_map, where_sql, req)
+            safe_limit = max(1, min(req.limit, 1000))
+            safe_offset = max(0, req.offset)
+            sql = build_aggregate_sql(
+                source_table=source_table,
+                schema_map=schema_map,
+                where_sql=where_sql,
+                group_by=req.group_by,
+                metrics=req.metrics,
+                having=req.having,
+                order_by=req.order_by,
+                limit=safe_limit,
+                offset=safe_offset,
+            )
 
         else:
             raise HTTPException(status_code=400, detail=f"Unknown mode: {req.mode}")
 
-        all_params = where_params + extra_params
-        cur = con.execute(sql, all_params)
-
-        cols = [d[0] for d in cur.description]
-        rows = cur.fetchall()
+        cur = con.execute(sql, params)
 
         if req.mode == "summary":
-            row = rows[0] if rows else (0, 0, 0, 0)
+            row = cur.fetchone()
             data = {
                 "n": int(row[0] or 0),
                 "win_rate": float(row[1] or 0),
@@ -808,6 +908,8 @@ def query_backtest(req: QueryRequest, x_api_key: Optional[str] = Header(default=
                 "tan_return": float(row[3] or 0),
             }
         else:
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
             data = [dict(zip(cols, r)) for r in rows]
 
         return {
@@ -818,7 +920,8 @@ def query_backtest(req: QueryRequest, x_api_key: Optional[str] = Header(default=
             "source_table": source_table,
             "filters": [f.model_dump() for f in req.filters],
             "column_filters": [f.model_dump() for f in req.column_filters],
-            "where": req.where.model_dump(by_alias=True, exclude_none=True) if req.where else None,
+            "where": req.where.model_dump(by_alias=True) if req.where is not None else None,
+            "expr_filters": [f.model_dump() for f in req.expr_filters],
             "group_by": req.group_by,
             "select": req.select,
             "metrics": [m.model_dump() for m in req.metrics],
