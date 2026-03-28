@@ -1,7 +1,7 @@
 import os
 import shutil
 import traceback
-from typing import Any, Dict, List, Optional, Literal, Tuple
+from typing import Any, Dict, List, Optional, Literal, Tuple, Union
 
 import duckdb
 from fastapi import FastAPI, Header, HTTPException, UploadFile, File
@@ -24,7 +24,6 @@ def resolve_db_path() -> str:
     if env_path:
         candidates.append(env_path)
 
-    # ローカル優先
     candidates.extend([
         r"C:\keiba\keiba.duckdb",
         "/app/data/keiba.duckdb",
@@ -35,13 +34,11 @@ def resolve_db_path() -> str:
         if p and os.path.exists(p):
             return p
 
-    # 存在しなくても、最優先候補を返す
     return env_path or r"C:\keiba\keiba.duckdb"
 
 
 DB_PATH = resolve_db_path()
 
-# 優先利用するテーブル
 PREFERRED_TABLES = [
     "backtest_with_training_clean",
     "training_latest_one_clean",
@@ -55,7 +52,6 @@ PREFERRED_TABLES = [
 ]
 
 
-
 # =========================
 # Pydantic
 # =========================
@@ -66,10 +62,17 @@ class FilterItem(BaseModel):
     value: Any
 
 
+class ColumnFilterItem(BaseModel):
+    left: str
+    op: Literal["=", "!=", ">", ">=", "<", "<="]
+    right: str
+
+
 class QueryRequest(BaseModel):
     mode: Literal["summary", "rows", "breakdown"] = "summary"
     filters: List[FilterItem] = Field(default_factory=list)
-    group_by: Optional[str] = None
+    column_filters: List[ColumnFilterItem] = Field(default_factory=list)
+    group_by: Optional[Union[str, List[str]]] = None
     limit: int = 100
 
 
@@ -78,7 +81,6 @@ class QueryRequest(BaseModel):
 # =========================
 
 def check_api_key(x_api_key: Optional[str]):
-    # APIキー未設定ならローカル利用前提でスキップ
     if not API_KEY:
         return
     if x_api_key != API_KEY:
@@ -120,7 +122,6 @@ def resolve_source_table(con) -> str:
 
 def get_schema_map(con, table_name: str) -> Dict[str, str]:
     rows = con.execute(f"DESCRIBE {quote_ident(table_name)}").fetchall()
-    # {列名: 型名}
     return {r[0]: r[1] for r in rows}
 
 
@@ -136,7 +137,6 @@ def is_numeric_type(type_name: str) -> bool:
 
 # =========================
 # フィールド別名マップ
-# 英字でも日本語でも通す
 # =========================
 
 FIELD_CANDIDATES: Dict[str, List[str]] = {
@@ -145,6 +145,7 @@ FIELD_CANDIDATES: Dict[str, List[str]] = {
     "horse_id": ["horse_id", "血統登録番号"],
     "horse_no": ["horse_no", "馬番"],
     "horse_name": ["horse_name", "馬名"],
+    "training_horse_name": ["training_horse_name"],
     "人気": ["人気"],
     "確定着順": ["確定着順"],
     "単勝オッズ": ["単勝オッズ"],
@@ -166,6 +167,8 @@ FIELD_CANDIDATES: Dict[str, List[str]] = {
     "斤量": ["斤量"],
     "上がり3Fタイム": ["上がり3Fタイム"],
     "PCI": ["PCI"],
+    "race_date": ["race_date"],
+    "work_date_full": ["work_date_full"],
 
     # 英字別名
     "class_code": ["クラスコード"],
@@ -207,11 +210,9 @@ NUMERIC_FIELD_NAMES = {
 
 
 def resolve_actual_column(field: str, schema_map: Dict[str, str]) -> str:
-    # まず列名そのものが存在する場合
     if field in schema_map:
         return field
 
-    # 別名候補
     candidates = FIELD_CANDIDATES.get(field, [])
     for c in candidates:
         if c in schema_map:
@@ -228,7 +229,6 @@ def field_expr(field: str, schema_map: Dict[str, str]) -> str:
     actual_type = schema_map[actual]
     q = quote_ident(actual)
 
-    # 数値扱いしたい列は、文字列型でも TRY_CAST で落ちにくくする
     if field in NUMERIC_FIELD_NAMES and not is_numeric_type(actual_type):
         return f"TRY_CAST({q} AS DOUBLE)"
 
@@ -236,14 +236,30 @@ def field_expr(field: str, schema_map: Dict[str, str]) -> str:
 
 
 def field_label(field: str, schema_map: Dict[str, str]) -> str:
-    # 結果表示用のグループ名ラベル
     return resolve_actual_column(field, schema_map)
 
 
 ALLOWED_OPS = {"=", "!=", ">", ">=", "<", "<=", "in", "like"}
+ALLOWED_COLUMN_OPS = {"=", "!=", ">", ">=", "<", "<="}
 
 
-def build_where(filters: List[FilterItem], schema_map: Dict[str, str]) -> Tuple[str, List[Any]]:
+def normalize_group_by(group_by: Optional[Union[str, List[str]]]) -> List[str]:
+    if group_by is None:
+        return []
+    if isinstance(group_by, str):
+        return [group_by]
+    if isinstance(group_by, list):
+        if not group_by:
+            return []
+        return group_by
+    raise HTTPException(status_code=400, detail="group_by must be string or string[]")
+
+
+def build_where(
+    filters: List[FilterItem],
+    column_filters: List[ColumnFilterItem],
+    schema_map: Dict[str, str]
+) -> Tuple[str, List[Any]]:
     clauses = ["1=1"]
     params: List[Any] = []
 
@@ -270,6 +286,14 @@ def build_where(filters: List[FilterItem], schema_map: Dict[str, str]) -> Tuple[
             placeholders = ",".join(["?"] * len(f.value))
             clauses.append(f"{expr} IN ({placeholders})")
             params.extend(f.value)
+
+    for cf in column_filters:
+        if cf.op not in ALLOWED_COLUMN_OPS:
+            raise HTTPException(status_code=400, detail=f"Column operator not allowed: {cf.op}")
+
+        left_expr = field_expr(cf.left, schema_map)
+        right_expr = field_expr(cf.right, schema_map)
+        clauses.append(f"{left_expr} {cf.op} {right_expr}")
 
     return " AND ".join(clauses), params
 
@@ -303,24 +327,31 @@ def build_breakdown_sql(
     source_table: str,
     schema_map: Dict[str, str],
     where_sql: str,
-    group_by: str,
+    group_by: Union[str, List[str]],
     limit: int
 ) -> str:
     finish_expr, odds_expr = resolve_summary_columns(schema_map)
-    group_expr = field_expr(group_by, schema_map)
+    group_fields = normalize_group_by(group_by)
+    if not group_fields:
+        raise HTTPException(status_code=400, detail="group_by is required for breakdown mode")
+
+    group_exprs = [field_expr(g, schema_map) for g in group_fields]
+    select_parts = [f"{expr} AS group_{i+1}" for i, expr in enumerate(group_exprs)]
+    group_select_sql = ",\n        ".join(select_parts)
+    order_cols = ", ".join([f"group_{i+1}" for i in range(len(group_exprs))])
     src = quote_ident(source_table)
 
     return f"""
     SELECT
-        {group_expr} AS group_value,
+        {group_select_sql},
         COUNT(*) AS n,
         ROUND(AVG(CASE WHEN {finish_expr} = 1 THEN 1.0 ELSE 0.0 END) * 100, 2) AS win_rate,
         ROUND(AVG(CASE WHEN {finish_expr} <= 3 THEN 1.0 ELSE 0.0 END) * 100, 2) AS place_rate,
         ROUND(AVG(CASE WHEN {finish_expr} = 1 THEN {odds_expr} ELSE 0 END) * 100, 2) AS tan_return
     FROM {src}
     WHERE {where_sql}
-    GROUP BY 1
-    ORDER BY n DESC
+    GROUP BY {order_cols}
+    ORDER BY n DESC, {order_cols}
     LIMIT {limit}
     """
 
@@ -366,6 +397,7 @@ def health():
         "columns": list(schema_map.keys()),
         "allowed_filter_names": sorted(list(FIELD_CANDIDATES.keys()) + list(schema_map.keys())),
         "allowed_ops": sorted(list(ALLOWED_OPS)),
+        "allowed_column_filter_ops": sorted(list(ALLOWED_COLUMN_OPS)),
     }
 
 
@@ -392,7 +424,7 @@ def query_backtest(req: QueryRequest, x_api_key: Optional[str] = Header(default=
         source_table = resolve_source_table(con)
         schema_map = get_schema_map(con, source_table)
 
-        where_sql, params = build_where(req.filters, schema_map)
+        where_sql, params = build_where(req.filters, req.column_filters, schema_map)
 
         if req.mode == "summary":
             sql = build_summary_sql(source_table, schema_map, where_sql)
@@ -436,6 +468,7 @@ def query_backtest(req: QueryRequest, x_api_key: Optional[str] = Header(default=
             "db_path": DB_PATH,
             "source_table": source_table,
             "filters": [f.model_dump() for f in req.filters],
+            "column_filters": [f.model_dump() for f in req.column_filters],
             "group_by": req.group_by,
             "result": data,
         }
