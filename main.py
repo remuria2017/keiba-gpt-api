@@ -2,10 +2,11 @@ import os
 import shutil
 import traceback
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional, Literal, Tuple, Union
 
 import duckdb
-from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Query
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -18,6 +19,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def ensure_json_utf8(request: Request, call_next):
+    response = await call_next(request)
+    content_type = response.headers.get("content-type", "")
+    if "application/json" in content_type and "charset=" not in content_type.lower():
+        response.headers["content-type"] = "application/json; charset=utf-8"
+    return response
 
 # =========================
 # 設定
@@ -157,6 +167,12 @@ class QueryRequest(BaseModel):
     order_by: List[OrderByItem] = Field(default_factory=list)
     limit: int = 100
     offset: int = 0
+
+
+class ResolveValueRequest(BaseModel):
+    field: str
+    value: str
+    limit: int = Field(default=10, ge=1, le=100)
 
 
 # =========================
@@ -758,6 +774,31 @@ def build_aggregate_sql(
 # 値解決
 # =========================
 
+def normalize_jp_text(v: Any) -> str:
+    if v is None:
+        return ""
+
+    if isinstance(v, bytes):
+        for enc in ("utf-8", "cp932", "shift_jis", "utf-8-sig", "euc_jp"):
+            try:
+                v = v.decode(enc)
+                break
+            except Exception:
+                continue
+        else:
+            v = v.decode("utf-8", errors="ignore")
+
+    v = str(v)
+    v = unicodedata.normalize("NFKC", v)
+    v = v.replace("\u3000", " ")
+    v = " ".join(v.split())
+    return v.strip()
+
+
+def normalize_for_match(v: Any) -> str:
+    return normalize_jp_text(v).replace(" ", "")
+
+
 RESOLVABLE_FIELDS = {
     "trainer": ["調教師", "調教師コード"],
     "調教師": ["調教師", "調教師コード"],
@@ -799,15 +840,17 @@ def resolve_value_columns(field: str, schema_map: Dict[str, str]) -> Tuple[str, 
     return label_col, code_col
 
 
-@app.get("/resolve_value")
-def resolve_value(
-    field: str = Query(...),
-    q: str = Query(...),
-    limit: int = Query(10, ge=1, le=100),
-    x_api_key: Optional[str] = Header(default=None),
-):
-    check_api_key(x_api_key)
+def _resolve_value_impl(field: str, query_text: str, limit: int) -> Dict[str, Any]:
     ensure_db()
+
+    field = normalize_jp_text(field)
+    query_text = normalize_jp_text(query_text)
+    query_key = normalize_for_match(query_text)
+
+    if not field:
+        raise HTTPException(status_code=400, detail="field is required")
+    if not query_key:
+        raise HTTPException(status_code=400, detail="q/value is empty")
 
     con = get_connection(read_only=True)
     try:
@@ -818,8 +861,6 @@ def resolve_value(
         src = quote_ident(source_table)
         label_expr = quote_ident(label_col)
 
-        search_value = f"%{q}%"
-
         if code_col and code_col != label_col:
             code_expr = quote_ident(code_col)
             sql = f"""
@@ -828,46 +869,49 @@ def resolve_value(
                 {code_expr} AS code
             FROM {src}
             WHERE {label_expr} IS NOT NULL
-              AND CAST({label_expr} AS VARCHAR) LIKE ?
             ORDER BY label
-            LIMIT {limit}
             """
-            rows = con.execute(sql, [search_value]).fetchall()
-            matches = [
-                {
-                    "label": r[0],
-                    "value": r[0],
-                    "code_field": code_col,
-                    "code": r[1],
-                }
-                for r in rows
-            ]
+            rows = con.execute(sql).fetchall()
         else:
             sql = f"""
             SELECT DISTINCT
-                {label_expr} AS label
+                {label_expr} AS label,
+                NULL AS code
             FROM {src}
             WHERE {label_expr} IS NOT NULL
-              AND CAST({label_expr} AS VARCHAR) LIKE ?
             ORDER BY label
-            LIMIT {limit}
             """
-            rows = con.execute(sql, [search_value]).fetchall()
-            matches = [
-                {
-                    "label": r[0],
-                    "value": r[0],
-                    "code_field": None,
-                    "code": None,
-                }
-                for r in rows
-            ]
+            rows = con.execute(sql).fetchall()
+
+        exact_matches: List[Dict[str, Any]] = []
+        partial_matches: List[Dict[str, Any]] = []
+
+        for raw_label, raw_code in rows:
+            label = normalize_jp_text(raw_label)
+            label_key = normalize_for_match(raw_label)
+            if not label_key:
+                continue
+
+            item = {
+                "label": raw_label,
+                "value": raw_label,
+                "code_field": code_col if (code_col and code_col != label_col) else None,
+                "code": raw_code if (code_col and code_col != label_col) else None,
+            }
+
+            if label_key == query_key:
+                exact_matches.append(item)
+            elif query_key in label_key:
+                partial_matches.append(item)
+
+        matches = exact_matches[:limit] if exact_matches else partial_matches[:limit]
 
         return {
             "ok": True,
             "field": field,
-            "q": q,
+            "q": query_text,
             "source_table": source_table,
+            "match_type": "exact" if exact_matches else "partial",
             "matches": matches,
         }
 
@@ -878,6 +922,26 @@ def resolve_value(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         con.close()
+
+
+@app.get("/resolve_value")
+def resolve_value(
+    field: str = Query(...),
+    q: str = Query(...),
+    limit: int = Query(10, ge=1, le=100),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    check_api_key(x_api_key)
+    return _resolve_value_impl(field=field, query_text=q, limit=limit)
+
+
+@app.post("/resolve_value")
+def resolve_value_post(
+    req: ResolveValueRequest,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    check_api_key(x_api_key)
+    return _resolve_value_impl(field=req.field, query_text=req.value, limit=req.limit)
 
 
 # =========================
@@ -922,6 +986,7 @@ def health():
         "supports_offset": True,
         "supports_expr_filters": True,
         "supports_resolve_value": True,
+        "resolve_value_methods": ["GET", "POST"],
         "derived_expr_names": sorted(list(DERIVED_EXPR_MAP.keys())),
         "resolvable_fields": sorted(list(RESOLVABLE_FIELDS.keys())),
     }
