@@ -5,7 +5,7 @@ import re
 from typing import Any, Dict, List, Optional, Literal, Tuple, Union
 
 import duckdb
-from fastapi import FastAPI, Header, HTTPException, UploadFile, File
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -59,7 +59,6 @@ PREFERRED_TABLES = [
     "training",
     "backtest",
 ]
-
 
 # =========================
 # Pydantic
@@ -127,9 +126,6 @@ class WhereColumnCondition(BaseModel):
     right: str
 
 
-WhereLeaf = Union[WhereCondition, WhereColumnCondition]
-
-
 class WhereAnd(BaseModel):
     and_: List["WhereNode"] = Field(alias="and")
 
@@ -150,15 +146,10 @@ WhereNot.model_rebuild()
 
 class QueryRequest(BaseModel):
     mode: Literal["summary", "rows", "breakdown", "aggregate"] = "summary"
-
-    # 旧互換
     filters: List[FilterItem] = Field(default_factory=list)
     column_filters: List[ColumnFilterItem] = Field(default_factory=list)
-
-    # 新仕様
     where: Optional[WhereNode] = None
     expr_filters: List[ExprFilterItem] = Field(default_factory=list)
-
     group_by: Optional[Union[str, List[str]]] = None
     select: Optional[List[str]] = None
     metrics: List[MetricItem] = Field(default_factory=list)
@@ -232,12 +223,12 @@ def is_numeric_type(type_name: str) -> bool:
 # =========================
 
 FIELD_CANDIDATES: Dict[str, List[str]] = {
-    # レース系
     "race_id": ["race_id", "入ID(新)"],
     "horse_id": ["horse_id", "血統登録番号"],
     "horse_no": ["horse_no", "馬番"],
     "horse_name": ["horse_name", "馬名"],
     "training_horse_name": ["training_horse_name"],
+
     "人気": ["人気"],
     "確定着順": ["確定着順"],
     "単勝オッズ": ["単勝オッズ"],
@@ -261,6 +252,8 @@ FIELD_CANDIDATES: Dict[str, List[str]] = {
     "PCI": ["PCI"],
     "race_date": ["race_date"],
     "work_date_full": ["work_date_full"],
+    "調教師コード": ["調教師コード"],
+    "騎手コード": ["騎手コード"],
 
     # 英字別名
     "class_code": ["クラスコード"],
@@ -279,6 +272,8 @@ FIELD_CANDIDATES: Dict[str, List[str]] = {
     "agari3f": ["上がり3Fタイム"],
     "weight": ["斤量"],
     "rank": ["人気"],
+    "trainer_code": ["調教師コード"],
+    "jockey_code": ["騎手コード"],
 
     # 調教系
     "course": ["course", "コース", "調教コース"],
@@ -297,6 +292,7 @@ NUMERIC_FIELD_NAMES = {
     "年齢", "頭数", "馬番", "年", "月", "日", "斤量", "上がり3Fタイム", "PCI",
     "class_code", "distance", "age", "field_size", "odds", "finish", "agari3f", "weight",
     "rank", "lap_1", "lap_2", "lap_3", "lap_4", "lap_last",
+    "trainer_code", "jockey_code", "調教師コード", "騎手コード",
 }
 
 ALLOWED_OPS = {"=", "!=", ">", ">=", "<", "<=", "in", "like", "between", "is_null", "is_not_null"}
@@ -329,10 +325,7 @@ def resolve_actual_column(field: str, schema_map: Dict[str, str]) -> str:
         if c in schema_map:
             return c
 
-    raise HTTPException(
-        status_code=400,
-        detail=f"Field not allowed or not found in source table: {field}"
-    )
+    raise HTTPException(status_code=400, detail=f"Field not allowed or not found in source table: {field}")
 
 
 def field_expr(field: str, schema_map: Dict[str, str]) -> str:
@@ -356,9 +349,7 @@ def normalize_group_by(group_by: Optional[Union[str, List[str]]]) -> List[str]:
     if isinstance(group_by, str):
         return [group_by]
     if isinstance(group_by, list):
-        if not group_by:
-            return []
-        return group_by
+        return [g for g in group_by if g]
     raise HTTPException(status_code=400, detail="group_by must be string or string[]")
 
 
@@ -382,16 +373,14 @@ def build_safe_expr(expr: str, schema_map: Dict[str, str]) -> str:
 
     def repl(m: re.Match) -> str:
         token = m.group(0)
-
-        # 論理語や関数名風トークンはそのまま通さない
         lowered = token.lower()
+
         if lowered in {"and", "or", "not", "null", "true", "false"}:
             return token
 
         if token in FIELD_CANDIDATES or token in schema_map:
             return field_expr(token, schema_map)
 
-        # 数字だけのようなものはここには来ないはずだが念のため
         if re.fullmatch(r"\d+", token):
             return token
 
@@ -456,32 +445,25 @@ def build_where_node(node: WhereNode, schema_map: Dict[str, str]) -> Tuple[str, 
         return build_filter_clause(FilterItem(field=node.field, op=node.op, value=node.value), schema_map)
 
     if isinstance(node, WhereColumnCondition):
-        return build_column_filter_clause(
-            ColumnFilterItem(left=node.left, op=node.op, right=node.right),
-            schema_map,
-        )
+        return build_column_filter_clause(ColumnFilterItem(left=node.left, op=node.op, right=node.right), schema_map)
 
     if isinstance(node, WhereAnd):
-        if not node.and_:
-            return "1=1", []
         clauses: List[str] = []
         params: List[Any] = []
         for child in node.and_:
             child_sql, child_params = build_where_node(child, schema_map)
             clauses.append(f"({child_sql})")
             params.extend(child_params)
-        return " AND ".join(clauses), params
+        return (" AND ".join(clauses) if clauses else "1=1"), params
 
     if isinstance(node, WhereOr):
-        if not node.or_:
-            return "1=0", []
-        clauses = []
+        clauses: List[str] = []
         params: List[Any] = []
         for child in node.or_:
             child_sql, child_params = build_where_node(child, schema_map)
             clauses.append(f"({child_sql})")
             params.extend(child_params)
-        return " OR ".join(clauses), params
+        return (" OR ".join(clauses) if clauses else "1=0"), params
 
     if isinstance(node, WhereNot):
         child_sql, child_params = build_where_node(node.not_, schema_map)
@@ -517,14 +499,7 @@ def build_where_legacy(
     return " AND ".join(clauses), params
 
 
-def build_where(
-    req: QueryRequest,
-    schema_map: Dict[str, str]
-) -> Tuple[str, List[Any], str]:
-    """
-    戻り値:
-      where_sql, params, where_mode
-    """
+def build_where(req: QueryRequest, schema_map: Dict[str, str]) -> Tuple[str, List[Any], str]:
     if req.where is not None:
         base_sql, base_params = build_where_node(req.where, schema_map)
         clauses = [f"({base_sql})"]
@@ -601,7 +576,7 @@ def metric_sql(item: MetricItem, schema_map: Dict[str, str]) -> str:
 
 
 # =========================
-# SQLビルダー
+# SQL
 # =========================
 
 def build_summary_sql(source_table: str, schema_map: Dict[str, str], where_sql: str) -> str:
@@ -693,6 +668,17 @@ def build_rows_sql(
     """
 
 
+def sql_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
+    s = str(value).replace("'", "''")
+    return f"'{s}'"
+
+
 def build_aggregate_sql(
     source_table: str,
     schema_map: Dict[str, str],
@@ -768,15 +754,130 @@ def build_aggregate_sql(
     """
 
 
-def sql_literal(value: Any) -> str:
-    if value is None:
-        return "NULL"
-    if isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-    if isinstance(value, (int, float)):
-        return str(value)
-    s = str(value).replace("'", "''")
-    return f"'{s}'"
+# =========================
+# 値解決
+# =========================
+
+RESOLVABLE_FIELDS = {
+    "trainer": ["調教師", "調教師コード"],
+    "調教師": ["調教師", "調教師コード"],
+    "trainer_code": ["調教師", "調教師コード"],
+    "調教師コード": ["調教師", "調教師コード"],
+
+    "jockey": ["騎手", "騎手コード"],
+    "騎手": ["騎手", "騎手コード"],
+    "jockey_code": ["騎手", "騎手コード"],
+    "騎手コード": ["騎手", "騎手コード"],
+
+    "course": ["course"],
+    "horse_name": ["馬名"],
+    "horse_id": ["horse_id", "血統登録番号"],
+}
+
+
+def resolve_value_columns(field: str, schema_map: Dict[str, str]) -> Tuple[str, Optional[str]]:
+    keys = RESOLVABLE_FIELDS.get(field)
+    if not keys:
+        raise HTTPException(status_code=400, detail=f"resolve_value unsupported field: {field}")
+
+    label_col = None
+    code_col = None
+
+    for candidate in keys:
+        actual = resolve_actual_column(candidate, schema_map)
+        if candidate in {"調教師", "騎手", "course", "馬名"}:
+            label_col = actual
+        elif candidate in {"調教師コード", "騎手コード", "horse_id", "血統登録番号"}:
+            code_col = actual
+
+    if label_col is None and code_col is None:
+        raise HTTPException(status_code=400, detail=f"resolve_value could not map field: {field}")
+
+    if label_col is None and code_col is not None:
+        label_col = code_col
+
+    return label_col, code_col
+
+
+@app.get("/resolve_value")
+def resolve_value(
+    field: str = Query(...),
+    q: str = Query(...),
+    limit: int = Query(10, ge=1, le=100),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    check_api_key(x_api_key)
+    ensure_db()
+
+    con = get_connection(read_only=True)
+    try:
+        source_table = resolve_source_table(con)
+        schema_map = get_schema_map(con, source_table)
+
+        label_col, code_col = resolve_value_columns(field, schema_map)
+        src = quote_ident(source_table)
+        label_expr = quote_ident(label_col)
+
+        search_value = f"%{q}%"
+
+        if code_col and code_col != label_col:
+            code_expr = quote_ident(code_col)
+            sql = f"""
+            SELECT DISTINCT
+                {label_expr} AS label,
+                {code_expr} AS code
+            FROM {src}
+            WHERE {label_expr} IS NOT NULL
+              AND CAST({label_expr} AS VARCHAR) LIKE ?
+            ORDER BY label
+            LIMIT {limit}
+            """
+            rows = con.execute(sql, [search_value]).fetchall()
+            matches = [
+                {
+                    "label": r[0],
+                    "value": r[0],
+                    "code_field": code_col,
+                    "code": r[1],
+                }
+                for r in rows
+            ]
+        else:
+            sql = f"""
+            SELECT DISTINCT
+                {label_expr} AS label
+            FROM {src}
+            WHERE {label_expr} IS NOT NULL
+              AND CAST({label_expr} AS VARCHAR) LIKE ?
+            ORDER BY label
+            LIMIT {limit}
+            """
+            rows = con.execute(sql, [search_value]).fetchall()
+            matches = [
+                {
+                    "label": r[0],
+                    "value": r[0],
+                    "code_field": None,
+                    "code": None,
+                }
+                for r in rows
+            ]
+
+        return {
+            "ok": True,
+            "field": field,
+            "q": q,
+            "source_table": source_table,
+            "matches": matches,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
 
 
 # =========================
@@ -820,7 +921,9 @@ def health():
         "supports_having": True,
         "supports_offset": True,
         "supports_expr_filters": True,
+        "supports_resolve_value": True,
         "derived_expr_names": sorted(list(DERIVED_EXPR_MAP.keys())),
+        "resolvable_fields": sorted(list(RESOLVABLE_FIELDS.keys())),
     }
 
 
@@ -893,7 +996,6 @@ def query_backtest(req: QueryRequest, x_api_key: Optional[str] = Header(default=
                 limit=safe_limit,
                 offset=safe_offset,
             )
-
         else:
             raise HTTPException(status_code=400, detail=f"Unknown mode: {req.mode}")
 
