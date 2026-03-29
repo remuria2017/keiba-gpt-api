@@ -5,4 +5,4 @@ __pycache__/
 .env
 .git
 keiba.duckdb
-*.duckdb
+*.duckdbkeiba.duckdb
