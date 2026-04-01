@@ -4,6 +4,8 @@ import traceback
 import re
 import unicodedata
 from typing import Any, Dict, List, Optional, Literal, Tuple, Union
+import sqlparse
+from fastapi import Body
 
 import duckdb
 from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Query, Request
@@ -167,6 +169,11 @@ class QueryRequest(BaseModel):
     having: List[HavingItem] = Field(default_factory=list)
     order_by: List[OrderByItem] = Field(default_factory=list)
     limit: int = 100
+    offset: int = 0
+
+class SQLQueryRequest(BaseModel):
+    sql: str
+    limit: int = 1000
     offset: int = 0
 
 
@@ -353,10 +360,10 @@ ALLOWED_METRIC_AGGS = {
 ALLOWED_HAVING_OPS = {"=", "!=", ">", ">=", "<", "<="}
 
 DERIVED_EXPR_MAP = {
-    "4F合計": "lap_4 + lap_3 + lap_2 + lap_last",
-    "加速ラップ": "lap_last < lap_2",
-    "減速ラップ": "lap_last > lap_2",
-    "同ラップ": "lap_last = lap_2",
+    "4F合計": "lap_2",
+    "加速ラップ": "lap_last < (lap_4 - lap_last)",
+    "減速ラップ": "lap_last > (lap_4 - lap_last)",
+    "同ラップ": "lap_last = (lap_4 - lap_last)",
 }
 
 _ALLOWED_EXPR_TOKENS = re.compile(r'[A-Za-z0-9_\u4e00-\u9fff\u3040-\u30ff・() +\-*/.<>=!]+$')
@@ -974,7 +981,62 @@ def resolve_value_post(
     check_api_key(x_api_key)
     return _resolve_value_impl(field=req.field, query_text=req.value, limit=req.limit)
 
+# =========================
+# SQL mode
+# =========================
 
+FORBIDDEN_SQL_KEYWORDS = {
+    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE",
+    "TRUNCATE", "ATTACH", "DETACH", "COPY", "EXPORT", "IMPORT",
+    "PRAGMA", "INSTALL", "LOAD", "REPLACE", "MERGE", "VACUUM",
+    "CALL"
+}
+
+
+def strip_sql_comments(sql: str) -> str:
+    sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
+    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    return sql
+
+
+def validate_sql_readonly(sql: str) -> str:
+    if not sql or not sql.strip():
+        raise HTTPException(status_code=400, detail="sql is empty")
+
+    cleaned = strip_sql_comments(sql).strip()
+
+    # 複文禁止
+    if ";" in cleaned.rstrip(";"):
+        raise HTTPException(status_code=400, detail="multiple SQL statements are not allowed")
+
+    upper_sql = cleaned.upper()
+
+    # SELECT / WITH のみ許可
+    if not (upper_sql.startswith("SELECT") or upper_sql.startswith("WITH")):
+        raise HTTPException(status_code=400, detail="only SELECT or WITH queries are allowed")
+
+    # 危険キーワード禁止
+    for kw in FORBIDDEN_SQL_KEYWORDS:
+        if re.search(rf"\b{re.escape(kw)}\b", upper_sql):
+            raise HTTPException(status_code=400, detail=f"forbidden SQL keyword detected: {kw}")
+
+    return cleaned
+
+
+def append_limit_offset(sql: str, limit: int, offset: int) -> str:
+    sql = sql.strip().rstrip(";")
+    upper_sql = sql.upper()
+
+    # すでに LIMIT があればそのまま
+    if re.search(r"\bLIMIT\b", upper_sql):
+        return sql
+
+    safe_limit = max(1, min(limit, 5000))
+    safe_offset = max(0, offset)
+
+    if safe_offset > 0:
+        return f"{sql}\nLIMIT {safe_limit} OFFSET {safe_offset}"
+    return f"{sql}\nLIMIT {safe_limit}"
 # =========================
 # API
 # =========================
@@ -1019,6 +1081,10 @@ def health():
         "resolve_value_methods": ["GET", "POST"],
         "derived_expr_names": sorted(list(DERIVED_EXPR_MAP.keys())),
         "resolvable_fields": sorted(list(RESOLVABLE_FIELDS.keys())),
+        "supports_sql_query": True,
+        "sql_query_readonly": True,
+        "sql_query_max_limit": 5000,
+        "allowed_ops": sorted(list(ALLOWED_OPS)),
     }
 
 
@@ -1033,6 +1099,40 @@ async def upload_db(file: UploadFile = File(...), x_api_key: Optional[str] = Hea
         shutil.copyfileobj(file.file, f)
 
     return {"ok": True, "path": DB_PATH, "size": os.path.getsize(DB_PATH)}
+
+@app.post("/sql_query")
+def sql_query(req: SQLQueryRequest, x_api_key: Optional[str] = Header(default=None)):
+    check_api_key(x_api_key)
+    ensure_db()
+
+    con = get_connection(read_only=True)
+    try:
+        validated_sql = validate_sql_readonly(req.sql)
+        final_sql = append_limit_offset(validated_sql, req.limit, req.offset)
+
+        cur = con.execute(final_sql)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = cur.fetchall()
+        data = [dict(zip(cols, r)) for r in rows]
+
+        applied_limit = max(1, min(req.limit, 5000))
+
+        return {
+            "ok": True,
+            "sql": final_sql,
+            "columns": cols,
+            "row_count": len(data),
+            "rows": data,
+            "truncated": len(data) >= applied_limit and "LIMIT" not in validated_sql.upper(),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        con.close()
 
 
 @app.post("/query")
